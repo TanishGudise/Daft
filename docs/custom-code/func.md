@@ -427,7 +427,7 @@ Both accept fractional values (e.g. `cpus=0.5`, `gpus=0.5`). `gpus` values above
 
 ### `max_concurrency`
 
-`max_concurrency` controls the maximum number of concurrent invocations of an async `@daft.func` or `@daft.func.batch`. It does not apply to synchronous (non-async) UDFs — setting it on a sync function raises.
+`max_concurrency` controls the maximum number of concurrent invocations of an async `@daft.func` or `@daft.func.batch`. It does not apply to synchronous (non-async) UDFs — setting it on a sync function raises. If it is not set, an async row-wise function runs at most 64 of its calls at a time in each process; set the `DAFT_MAX_ASYNC_UDF_INFLIGHT_TASKS` environment variable to change that default.
 
 ```python
 @daft.func(max_concurrency=10)

@@ -177,48 +177,56 @@ impl RowWisePyFn {
             );
         }
 
-        let max_retries = self.max_retries.unwrap_or(0);
         let name = args[0].name();
 
-        let result = crate::python_udf::retry::retry_with_backoff_async(
-            || async { self.call_async_batch_once(args, num_rows, name).await },
-            max_retries,
-        )
-        .await;
+        // Retries and `on_error` are applied to each row inside `call_async_func_batched`, so a failing row
+        // doesn't re-run or null the other rows of the batch.
+        let result = self.call_async_batch_once(args, num_rows, name).await;
 
-        if let Ok((_, operator_metrics)) = &result {
+        if let Ok((_, operator_metrics, _)) = &result {
             crate::python_udf::collect_operator_metrics(operator_metrics, metrics);
         }
 
         match (result, self.on_error) {
-            (Ok((result_series, _)), _) => Ok(result_series.cast(&self.return_dtype)?.rename(name)),
+            (Ok((result_series, _, row_errors)), on_error) => {
+                if matches!(on_error, OnError::Log) {
+                    for row_error in row_errors {
+                        Self::log_async_error(&DaftError::PyO3Error(row_error));
+                    }
+                }
+                Ok(result_series.cast(&self.return_dtype)?.rename(name))
+            }
             (Err(err), OnError::Raise) => Err(err),
             (Err(err), OnError::Log) => {
-                log::warn!("Python UDF error: {}", err);
+                Self::log_async_error(&err);
                 let num_rows = args.iter().map(Series::len).max().unwrap();
-
-                let logger_provider = common_tracing::GLOBAL_LOGGER_PROVIDER.lock().unwrap();
-                if let Some(logger_provider) = logger_provider.as_ref() {
-                    let logger = logger_provider.logger("python-udf-error");
-                    let mut log_record = logger.create_log_record();
-
-                    if let DaftError::PyO3Error(py_err) = &err {
-                        Python::attach(|py| {
-                            Self::capture_exception_details(py, py_err, &mut log_record);
-                        });
-                    } else {
-                        log_record.set_body(format!("{err}").into());
-                    }
-
-                    logger.emit(log_record);
-                }
-
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
             (Err(_), OnError::Ignore) => {
                 let num_rows = args.iter().map(Series::len).max().unwrap();
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
+        }
+    }
+
+    #[cfg(feature = "python")]
+    fn log_async_error(err: &common_error::DaftError) {
+        log::warn!("Python UDF error: {}", err);
+
+        let logger_provider = common_tracing::GLOBAL_LOGGER_PROVIDER.lock().unwrap();
+        if let Some(logger_provider) = logger_provider.as_ref() {
+            let logger = logger_provider.logger("python-udf-error");
+            let mut log_record = logger.create_log_record();
+
+            if let common_error::DaftError::PyO3Error(py_err) = err {
+                Python::attach(|py| {
+                    Self::capture_exception_details(py, py_err, &mut log_record);
+                });
+            } else {
+                log_record.set_body(format!("{err}").into());
+            }
+
+            logger.emit(log_record);
         }
     }
 
@@ -439,52 +447,72 @@ impl RowWisePyFn {
         args: &[Series],
         num_rows: usize,
         name: &str,
-    ) -> DaftResult<(Series, common_metrics::python::PyOperatorMetrics)> {
+    ) -> DaftResult<(
+        Series,
+        common_metrics::python::PyOperatorMetrics,
+        Vec<PyErr>,
+    )> {
         use common_metrics::python::PyOperatorMetrics;
         use daft_core::python::PySeries;
         use pyo3::prelude::*;
+
+        use crate::functions::python::OnError;
 
         let cls = self.cls.clone();
         let method = self.method.clone();
         let original_args = self.original_args.clone();
         let args = args.to_vec();
         let return_dtype = self.return_dtype.clone();
+        let max_concurrency = self.max_concurrency.map(NonZeroUsize::get);
+        let max_retries = self.max_retries.unwrap_or(0);
+        let raise_on_error = matches!(self.on_error, OnError::Raise);
 
-        let (py_series, operator_metrics) = common_runtime::python::execute_python_coroutine::<
-            _,
-            (PySeries, PyOperatorMetrics),
-        >(move |py| {
-            let f = py
-                .import(pyo3::intern!(py, "daft.udf.execution"))?
-                .getattr(pyo3::intern!(py, "call_async_func_batched"))?;
-            let mut evaluated_args = Vec::with_capacity(num_rows);
-            for i in 0..num_rows {
-                let py_args_for_row = args
-                    .iter()
-                    .map(|s| {
-                        let idx = if s.len() == 1 { 0 } else { i };
-                        let lit = s.get_lit(idx);
-                        lit.into_pyobject(py)
-                            .map_err(|e| e.into())
-                            .map(|obj| obj.unbind())
-                    })
-                    .collect::<DaftResult<Vec<_>>>()?;
+        let (py_series, operator_metrics, row_errors) =
+            common_runtime::python::execute_python_coroutine::<
+                _,
+                (PySeries, PyOperatorMetrics, Vec<Py<PyAny>>),
+            >(move |py| {
+                let f = py
+                    .import(pyo3::intern!(py, "daft.udf.execution"))?
+                    .getattr(pyo3::intern!(py, "call_async_func_batched"))?;
+                let mut evaluated_args = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    let py_args_for_row = args
+                        .iter()
+                        .map(|s| {
+                            let idx = if s.len() == 1 { 0 } else { i };
+                            let lit = s.get_lit(idx);
+                            lit.into_pyobject(py)
+                                .map_err(|e| e.into())
+                                .map(|obj| obj.unbind())
+                        })
+                        .collect::<DaftResult<Vec<_>>>()?;
 
-                evaluated_args.push(py_args_for_row);
-            }
-            let py_return_type = daft_core::python::PyDataType::from(return_dtype.clone());
-            let coroutine = f.call1((
-                cls.as_ref(),
-                method.as_ref(),
-                py_return_type,
-                original_args.as_ref(),
-                evaluated_args,
-            ))?;
-            Ok(coroutine)
-        })
-        .await?;
+                    evaluated_args.push(py_args_for_row);
+                }
+                let py_return_type = daft_core::python::PyDataType::from(return_dtype.clone());
+                let coroutine = f.call1((
+                    cls.as_ref(),
+                    method.as_ref(),
+                    py_return_type,
+                    original_args.as_ref(),
+                    evaluated_args,
+                    max_concurrency,
+                    max_retries,
+                    raise_on_error,
+                ))?;
+                Ok(coroutine)
+            })
+            .await?;
 
-        Ok((py_series.series.rename(name), operator_metrics))
+        let row_errors = Python::attach(|py| {
+            row_errors
+                .into_iter()
+                .map(|error| PyErr::from_value(error.into_bound(py)))
+                .collect()
+        });
+
+        Ok((py_series.series.rename(name), operator_metrics, row_errors))
     }
 }
 

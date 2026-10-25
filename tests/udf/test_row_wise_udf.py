@@ -198,6 +198,116 @@ def test_row_wise_async_udf_max_concurrency(max_concurrency):
     assert sorted(result["x"]) == [5, 7, 9]
 
 
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="Counts calls in this process")
+@pytest.mark.parametrize("max_concurrency", [1, 4])
+def test_row_wise_async_udf_max_concurrency_bounds_calls_in_flight(max_concurrency):
+    in_flight = {"now": 0, "peak": 0}
+
+    @daft.func(max_concurrency=max_concurrency)
+    async def tracked(x: int) -> int:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await asyncio.sleep(0.001)
+        in_flight["now"] -= 1
+        return x
+
+    df = daft.from_pydict({"x": list(range(50))})
+    assert df.select(tracked(col("x"))).to_pydict() == {"x": list(range(50))}
+    assert in_flight["peak"] <= max_concurrency
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="Counts calls in this process")
+def test_row_wise_async_udf_ray_options_do_not_limit_calls_to_one():
+    in_flight = {"now": 0, "peak": 0}
+
+    @daft.func(ray_options={"max_restarts": 0})
+    async def tracked(x: int) -> int:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await asyncio.sleep(0.001)
+        in_flight["now"] -= 1
+        return x
+
+    df = daft.from_pydict({"x": list(range(50))})
+    assert df.select(tracked(col("x"))).to_pydict() == {"x": list(range(50))}
+    assert in_flight["peak"] > 1
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="Counts calls in this process")
+def test_row_wise_async_udf_default_limit_bounds_calls_in_flight():
+    in_flight = {"now": 0, "peak": 0}
+
+    @daft.func
+    async def tracked(x: int) -> int:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await asyncio.sleep(0)
+        in_flight["now"] -= 1
+        return x
+
+    df = daft.from_pydict({"x": list(range(3000))})
+    assert df.select(tracked(col("x"))).to_pydict() == {"x": list(range(3000))}
+    assert 1 < in_flight["peak"] <= 64
+
+
+def test_row_wise_async_udf_preserves_row_order():
+    @daft.func
+    async def earlier_rows_finish_last(x: int) -> int:
+        await asyncio.sleep((50 - x) * 0.001)
+        return x
+
+    df = daft.from_pydict({"x": list(range(50))})
+    assert df.select(earlier_rows_finish_last(col("x"))).to_pydict() == {"x": list(range(50))}
+
+
+def test_async_rowwise_on_err_ignore_nulls_only_failed_rows():
+    @daft.func(on_error="ignore")
+    async def raise_err(x) -> int:
+        if x % 2:
+            raise ValueError("This is an error")
+        return x
+
+    df = daft.from_pydict({"value": [1, 2, 3, 4]})
+    assert df.select(raise_err(col("value"))).to_pydict() == {"value": [None, 2, None, 4]}
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="Counts calls in this process")
+def test_async_rowwise_retries_only_failed_rows():
+    calls = {}
+
+    @daft.func(max_retries=1)
+    async def fails_once_for_two(x: int) -> int:
+        calls[x] = calls.get(x, 0) + 1
+        if x == 2 and calls[x] == 1:
+            raise ValueError("transient error")
+        return x
+
+    df = daft.from_pydict({"x": [0, 1, 2, 3]})
+    assert df.select(fails_once_for_two(col("x"))).to_pydict() == {"x": [0, 1, 2, 3]}
+    assert calls == {0: 1, 1: 1, 2: 2, 3: 1}
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "native", reason="Counts calls in this process")
+def test_async_rowwise_raise_cancels_other_rows():
+    cancelled = {"count": 0}
+
+    @daft.func
+    async def first_row_fails(x: int) -> int:
+        if x == 0:
+            raise ValueError("This is an error")
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled["count"] += 1
+            raise
+        return x
+
+    df = daft.from_pydict({"x": list(range(5))})
+    with pytest.raises(ValueError, match="This is an error"):
+        df.select(first_row_fails(col("x"))).to_pydict()
+    assert cancelled["count"] == 4
+
+
 def test_sync_func_max_concurrency_raises():
     with pytest.raises(ValueError, match="max_concurrency.*synchronous"):
 

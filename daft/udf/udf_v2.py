@@ -317,8 +317,10 @@ class Func(Generic[P, T, C]):
                 "Cannot set 'memory' in `ray_options`. Please use the 'memory_bytes' argument in @daft.func or @daft.cls instead."
             )
 
-        # If there are any ray options (other than the banned resource ones), we must use an actor pool
-        max_concurrency = self.max_concurrency or (1 if ray_options else None)
+        # If there are any ray options (other than the banned resource ones), we must use an actor pool.
+        # For async row-wise UDFs, max_concurrency caps concurrent calls, so don't default it to 1 for them.
+        is_async_row_wise = self.is_async and not self.is_batch
+        max_concurrency = self.max_concurrency or (1 if ray_options and not is_async_row_wise else None)
 
         # TODO: implement generator UDFs on the engine side
         if self.is_generator:
