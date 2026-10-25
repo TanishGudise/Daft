@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -126,6 +127,12 @@ class LocalVLLMExecutor(VLLMExecutor):
         self.error: BaseException | None = None
 
         self.completed_tasks: deque[tuple[str, RecordBatch]] = deque()
+        # On Ray, results and in-flight counts per RemoteVLLMExecutor (one per partition), so each partition
+        # polls and waits for its own prompts only.
+        self.completed_by_owner: defaultdict[str, deque[tuple[str, RecordBatch]]] = defaultdict(deque)
+        self.running_by_owner: defaultdict[str, int] = defaultdict(int)
+        # Holds references to submit_async's tasks until they finish.
+        self.generate_tasks: set[asyncio.Task[None]] = set()
 
         self.last_log_time = time.perf_counter()
         self.last_log_lock = threading.Lock()
@@ -158,7 +165,7 @@ class LocalVLLMExecutor(VLLMExecutor):
                 if self.error is not None or (self._finished_submitting and self.running_task_count == 0):
                     return
 
-    async def _generate(self, prompt: str, row: RecordBatch) -> None:
+    async def _generate(self, prompt: str, row: RecordBatch, owner: str | None = None) -> None:
         try:
             with self.counter_lock:
                 id = self.counter
@@ -169,7 +176,8 @@ class LocalVLLMExecutor(VLLMExecutor):
                 final_output = output
 
             output_text: str = final_output.outputs[0].text  # type: ignore
-            self.completed_tasks.append((output_text, row))
+            completed = self.completed_tasks if owner is None else self.completed_by_owner[owner]
+            completed.append((output_text, row))
         except BaseException as e:
             # Nothing awaits this task, so keep the error for poll() to raise.
             with self.task_count_lock:
@@ -181,6 +189,8 @@ class LocalVLLMExecutor(VLLMExecutor):
         finally:
             with self.task_count_lock:
                 self.running_task_count -= 1
+                if owner is not None:
+                    self.running_by_owner[owner] -= 1
 
         # Check if we need to log (in case periodic log isn't running in distributed mode)
         current_time = time.perf_counter()
@@ -209,19 +219,23 @@ class LocalVLLMExecutor(VLLMExecutor):
             row = rows.slice(i, i + 1)
             asyncio.run_coroutine_threadsafe(self._generate(prompt, row), self.loop)
 
-    async def submit_async(self, prompts: list[str], rows: RecordBatch) -> None:
+    async def submit_async(self, prompts: list[str], rows: RecordBatch, owner: str | None = None) -> None:
         assert len(prompts) == len(rows), "Number of prompts and rows must match"
 
         with self.task_count_lock:
             self.running_task_count += len(prompts)
+            if owner is not None:
+                self.running_by_owner[owner] += len(prompts)
 
         for i in range(len(prompts)):
             prompt = prompts[i]
             row = rows.slice(i, i + 1)
-            asyncio.create_task(self._generate(prompt, row))
+            task = asyncio.create_task(self._generate(prompt, row, owner))
+            self.generate_tasks.add(task)
+            task.add_done_callback(self.generate_tasks.discard)
 
-    def poll(self) -> tuple[list[str], RecordBatch] | None:
-        """Poll the executor for completed tasks."""
+    def poll(self, owner: str | None = None) -> tuple[list[str], RecordBatch] | None:
+        """Poll the executor for completed tasks (on Ray, only those submitted by `owner`)."""
         with self.task_count_lock:
             error = self.error
         if error is not None:
@@ -230,10 +244,13 @@ class LocalVLLMExecutor(VLLMExecutor):
         # Drain the queues (no lock needed - queues are thread-safe)
         completed_outputs = []
         completed_rows = []
+        completed = self.completed_tasks if owner is None else self.completed_by_owner.get(owner)
+        if completed is None:
+            return None
 
         while True:
             try:
-                (output, row) = self.completed_tasks.popleft()
+                (output, row) = completed.popleft()
                 completed_outputs.append(output)
                 completed_rows.append(row)
             except IndexError:
@@ -256,36 +273,78 @@ class LocalVLLMExecutor(VLLMExecutor):
             raise error
         return finished
 
+    def pending(self, owner: str) -> int:
+        """Number of `owner`'s prompts that are still running or whose results haven't been polled."""
+        with self.task_count_lock:
+            error = self.error
+            pending = self.running_by_owner.get(owner, 0) + len(self.completed_by_owner.get(owner, ()))
+            if pending == 0:
+                self.running_by_owner.pop(owner, None)
+                self.completed_by_owner.pop(owner, None)
+        if error is not None:
+            raise error
+        return pending
+
 
 class RemoteVLLMExecutor(VLLMExecutor):
+    """Submits one partition's prompts to the shared vLLM actors and collects only that partition's results."""
+
     def __init__(self, llm_actors: LLMActors):
         self.router_actor = llm_actors.router_actor
-        self.router_actor.report_start.remote()
-
         self.llm_actors = llm_actors.llm_actors
+        self.owner = uuid.uuid4().hex
+        self.submitted: dict[int, int] = {}  # actor index -> rows sent to it
+        self.received = 0
+        self._finished_submitting = False
+
+    @staticmethod
+    def _get(refs: Any) -> Any:
+        import ray
+
+        try:
+            return ray.get(refs)
+        except (ray.exceptions.RayActorError, ray.exceptions.ActorUnschedulableError) as e:
+            # Fail the query here. If a Ray actor error reaches the scheduler, it retries the task as if its
+            # worker had failed, and the query can return with rows missing.
+            raise RuntimeError(f"A vLLM actor failed or restarted during the query: {e}") from None
 
     def submit(self, prefix: str | None, prompts: list[str], rows: RecordBatch) -> None:
-        import ray
-
-        route_to = ray.get(self.router_actor.route.remote(prefix, len(prompts)))
-        ray.get(self.llm_actors[route_to].submit_async.remote(prompts, rows))
+        route_to = self._get(self.router_actor.route.remote(prefix, len(prompts)))
+        self._get(self.llm_actors[route_to].submit_async.remote(prompts, rows, self.owner))
+        self.submitted[route_to] = self.submitted.get(route_to, 0) + len(prompts)
 
     def poll(self) -> tuple[list[str], RecordBatch] | None:
-        import ray
-
-        next_llm_to_poll = ray.get(self.router_actor.get_next_llm_to_poll.remote())
-        if next_llm_to_poll is not None:
-            return ray.get(self.llm_actors[next_llm_to_poll].poll.remote())
-        else:
+        actors = list(self.submitted)
+        if not actors:
             return None
+        results = self._get([self.llm_actors[actor].poll.remote(self.owner) for actor in actors])
+        outputs: list[str] = []
+        rows = []
+        for result in results:
+            if result is not None:
+                outputs.extend(result[0])
+                rows.append(result[1])
+        if not outputs:
+            return None
+        self.received += len(outputs)
+        return outputs, RecordBatch.concat(rows)
 
     def finished_submitting(self) -> None:
-        self.router_actor.report_completion.remote()
+        self._finished_submitting = True
 
     def all_tasks_finished(self) -> bool:
-        import ray
-
-        return ray.get(self.router_actor.all_tasks_finished.remote())
+        if not self._finished_submitting:
+            return False
+        actors = list(self.submitted)
+        if any(self._get([self.llm_actors[actor].pending.remote(self.owner) for actor in actors])):
+            return False
+        sent = sum(self.submitted.values())
+        if self.received < sent:
+            raise RuntimeError(
+                f"{sent - self.received} of {sent} prompts sent to vLLM actors never returned a result "
+                "(a vLLM actor may have restarted)"
+            )
+        return True
 
 
 class PrefixRouter:
@@ -297,8 +356,6 @@ class PrefixRouter:
         self.recent_prefixes: list[list[str | None]] = [[] for _ in range(len(self.llm_actors))]
         self.load_balance_threshold = load_balance_threshold
         self.max_recent_prefixes = max_recent_prefixes
-        self.unfinished_actors = 0
-        self.next_llm_to_poll = list(range(len(self.llm_actors)))
 
     def route(self, prefix: str | None, batch_size: int) -> int:
         min_load = min(self.loads)
@@ -328,31 +385,6 @@ class PrefixRouter:
         self.loads[best_actor] += batch_size
 
         return best_actor
-
-    def report_start(self) -> None:
-        self.unfinished_actors += 1
-
-    def report_completion(self) -> None:
-        self.unfinished_actors -= 1
-
-        if self.unfinished_actors == 0:
-            for actor in self.llm_actors:
-                actor.finished_submitting.remote()
-
-    def get_next_llm_to_poll(self) -> int | None:
-        import ray
-
-        while len(self.next_llm_to_poll) > 0:
-            next_llm = self.next_llm_to_poll.pop(0)
-
-            if not ray.get(self.llm_actors[next_llm].all_tasks_finished.remote()):
-                self.next_llm_to_poll.append(next_llm)
-                return next_llm
-
-        return None
-
-    def all_tasks_finished(self) -> bool:
-        return len(self.next_llm_to_poll) == 0
 
 
 class LLMActors:
